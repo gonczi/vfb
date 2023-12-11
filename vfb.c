@@ -24,6 +24,8 @@
 #include <linux/init.h>
 
 #define VFB_DRIVER_NAME "vfb"
+#define VFB_DEVHANDLER_NAME "virtual_fb"
+
     /*
      *  RAM we reserve for the frame buffer. This defines the maximum screen
      *  size
@@ -91,8 +93,9 @@ static const struct fb_ops vfb_ops = {
 	.fb_mmap		= vfb_mmap,
 };
 
-static int vfb_create_device(const char* id);
-static void vfb_get_device_id(struct platform_device *dev, char* id, size_t max_len);
+static int vfb_create_device(const char* name);
+static void vfb_delete_device(const char* name);
+static void vfb_get_device_name(struct platform_device *dev, char* name, size_t max_len);
 static void vfb_delete_devices(void);
 
 static DEFINE_MUTEX(vfb_device_pool_lock);
@@ -103,6 +106,28 @@ struct vfb_device_pool_item {
 	struct platform_device *dev;
 };
 static struct vfb_device_pool_item vfb_device_pool[VFB_DEVICE_POOL_SIZE];
+
+static int vfb_devhandler_init(void);
+static void vfb_devhandler_exit(void);
+
+static int vfb_devhandler_open(struct inode *, struct file *);
+static int vfb_devhandler_release(struct inode *, struct file *);
+static ssize_t vfb_devhandler_read(struct file *, char *, size_t, loff_t *);
+static ssize_t vfb_devhandler_write(struct file *, const char *, size_t, loff_t *);
+
+static int vfb_devhandler_major = 0;    // Major number assigned to our device driver
+static int vfb_devhandler_is_open = 0;  // Is device open?  Used to prevent multiple access to the device
+
+struct class * vfb_devhandler_cl = NULL;
+struct device * vfb_devhandler_dev = NULL; 
+
+struct file_operations vfb_devhandler_fops __attribute__((__section__(".text"))) = {
+	read: vfb_devhandler_read,
+	write: vfb_devhandler_write,
+	open: vfb_devhandler_open,
+	release: vfb_devhandler_release
+};
+
 
     /*
      *  Internal routines
@@ -468,7 +493,7 @@ static int vfb_probe(struct platform_device *dev)
 	}
 
 	info->fix = vfb_fix;
-	vfb_get_device_id(dev, info->fix.id, sizeof(info->fix.id));
+	vfb_get_device_name(dev, info->fix.id, sizeof(info->fix.id));
 	info->fix.smem_start = (unsigned long) videomemory;
 	info->fix.smem_len = videomemorysize;
 
@@ -522,26 +547,48 @@ static struct platform_driver vfb_driver = {
 	},
 };
 
-static int vfb_create_device(const char* id)
+static int vfb_create_device(const char* name)
 {
 	int ret;
 	int pdpidx = -1;
+	bool name_already_exists = false;
 
 	printk("vfb_create_device\n");
 
+	//------------------------------------------
 	mutex_lock(&vfb_device_pool_lock);
+	
+	name_already_exists = false;
 	for (int i = 0; i < VFB_DEVICE_POOL_SIZE; i++) {
-		if (!vfb_device_pool[i].in_use) {
-			vfb_device_pool[i].in_use = 1;
-			strncpy(vfb_device_pool[i].id, id, sizeof(vfb_device_pool[i].id));
-			pdpidx = i;
-			break;
+		if (vfb_device_pool[i].in_use) {
+			if (0 == strncmp(vfb_device_pool[i].id, name, sizeof(vfb_device_pool[i].id) - 1)) {
+				name_already_exists = true;
+				break;
+			}
 		}
 	}
+	
+	if (false == name_already_exists) {
+		for (int i = 0; i < VFB_DEVICE_POOL_SIZE; i++) {
+			if (!vfb_device_pool[i].in_use) {
+				vfb_device_pool[i].in_use = 1;
+				strncpy(vfb_device_pool[i].id, name, sizeof(vfb_device_pool[i].id)); // --> /sys/class/graphics/fb*/name
+				pdpidx = i;
+				break;
+			}
+		}
+	} 
+
 	mutex_unlock(&vfb_device_pool_lock);
+	//------------------------------------------
+
+	if (true == name_already_exists) {
+		printk("vfb_create_device: device name (%s) already exists\n", name);
+		return -EINVAL;
+	}
 
 	if (pdpidx == -1) {
-		printk("vfb_create_device: can't alloc new device\n");
+		printk("vfb_create_device: can't alloc more device\n");
 		return -ENOMEM;
 	}
 
@@ -562,14 +609,42 @@ static int vfb_create_device(const char* id)
 	return ret;
 }
 
-static void vfb_get_device_id(struct platform_device *dev, char* id, size_t max_len)
+void vfb_delete_device(const char* name)
+{
+	printk("vfb_delete_device [%s]\n", name);
+
+	for (int i = 0; i < VFB_DEVICE_POOL_SIZE; i++) {
+		struct platform_device *dev = NULL;
+
+		mutex_lock(&vfb_device_pool_lock);
+		if (vfb_device_pool[i].in_use
+			&& (0 == strncmp(vfb_device_pool[i].id, name, sizeof(vfb_device_pool[i].id) - 1))) {
+			
+			dev = vfb_device_pool[i].dev;
+			vfb_device_pool[i].in_use = 0;
+			vfb_device_pool[i].dev = NULL;
+		}
+		mutex_unlock(&vfb_device_pool_lock);
+
+		if (dev) {
+			printk("vfb_delete_device: platform_device_unregister[%d]\n", i);
+			platform_device_unregister(dev);
+			
+			return;
+		}
+	}
+
+	printk("vfb_delete_devices: device not found\n");
+}
+
+static void vfb_get_device_name(struct platform_device *dev, char* name, size_t max_len)
 {
 	mutex_lock(&vfb_device_pool_lock);
 	for (int i = 0; i < VFB_DEVICE_POOL_SIZE; i++) {
 		if (vfb_device_pool[i].in_use 
 			&& (dev == vfb_device_pool[i].dev)) {
 
-			strncpy(id, vfb_device_pool[i].id, max_len);
+			strncpy(name, vfb_device_pool[i].id, max_len);
 			break;
 		}
 	}
@@ -621,18 +696,13 @@ static int __init vfb_init(void)
 
 	if (!ret) {
 		ret = vfb_create_device("Virtual FB");
-
-//XXX: test only
-// if (!ret) {
-// 	ret = vfb_create_device("Virtual FB#2");
-// }
-// if (!ret) {
-// 	ret = vfb_create_device("Virtual FB#3");
-// }
-
 		if (ret) {
 			platform_driver_unregister(&vfb_driver);
 		}
+	}
+
+	if (!ret) {
+		vfb_devhandler_init();
 	}
 
 	return ret;
@@ -645,6 +715,8 @@ static void __exit vfb_exit(void)
 {
 	printk("vfb_exit\n");
 
+	vfb_devhandler_exit();
+
 	vfb_delete_devices();
 	platform_driver_unregister(&vfb_driver);
 }
@@ -654,164 +726,122 @@ module_exit(vfb_exit);
 MODULE_LICENSE("GPL");
 #endif				/* MODULE */
 
-// int vfb_pool_init(void);
-// void vfb_pool_exit(void);
-
-// #define DEVICE_NAME "virtual_fb"
-// static int device_open(struct inode *, struct file *);
-// static int device_release(struct inode *, struct file *);
-// static ssize_t device_read(struct file *, char *, size_t, loff_t *);
-// static ssize_t device_write(struct file *, const char *, size_t, loff_t *);
-
-// static int Major;            /* Major number assigned to our device driver */
-// static int Device_Open = 0;  /* Is device open?  Used to prevent multiple access to the device */
-
-// struct class * cl;
-// struct device * dev; 
-
-// struct file_operations fops __attribute__((__section__(".text"))) = {
-//        read: device_read,
-//        write: device_write,
-//        open: device_open,
-//        release: device_release
-// };
-
-// static struct platform_device *vfb_device_pool[32] = {0};
-
-// int vfb_pool_init(void)
-// {
-//     int res = 0;
-
-// 	memset(vfb_device_pool, 0, sizeof(vfb_device_pool));
-
-//     Major = register_chrdev(0, DEVICE_NAME, &fops);	
-//     if (Major < 0) {
-// 	    printk("Registering the character device failed with %d\n", Major);
-//         res = Major;
-// 	    goto fail1;
-//     }
-//     printk("virtual_fb: Major=%d\n", Major);
-
-//     cl = class_create(THIS_MODULE, DEVICE_NAME);
-//     if (!IS_ERR(cl)) {
-// 	    dev = device_create(cl, NULL, MKDEV(Major,0), NULL, DEVICE_NAME);
-//     }
-
-// fail1:
-    
-//     return res;
-// }
-
-
-// static int device_open(struct inode *inode, struct file *file) 
-// {
-//     if (Device_Open) return -EBUSY;
-//     try_module_get(THIS_MODULE);
-//     ++Device_Open;
-//     return 0;
-// }
+static int vfb_devhandler_open(struct inode *inode, struct file *file) 
+{
+    if (vfb_devhandler_is_open) return -EBUSY;
+    try_module_get(THIS_MODULE);
+    ++vfb_devhandler_is_open;
+    return 0;
+}
 	
-// static int device_release(struct inode *inode, struct file *file) 
-// {
-//     --Device_Open;
-//     module_put(THIS_MODULE);
-//     return 0;
-// }
+static int vfb_devhandler_release(struct inode *inode, struct file *file) 
+{
+    --vfb_devhandler_is_open;
+    module_put(THIS_MODULE);
+    return 0;
+}
 
-// static ssize_t device_read(struct file *filp, char *buffer, size_t length, loff_t *offset) 
-// {
-//     const char* message = 
-//         "Usage: write the following commands to /dev/virtual_fb:\n"
-//         "    a 0    - add new fb device\n"
-//         "    d num  - delete /dev/fb[num] device\n";
-//     const size_t msgsize = strlen(message);
-//     loff_t off = *offset;
-//     if (off >= msgsize) {
-//         return 0;
-//     }
-//     if (length > msgsize - off) {
-//         length = msgsize - off;
-//     }
-//     if (copy_to_user(buffer, message+off, length) != 0) {
-//         return -EFAULT;
-//     }
+static ssize_t vfb_devhandler_read(struct file *filp, char *buffer, size_t length, loff_t *offset) 
+{
+    const char* message = 
+        "Usage: write the following commands to /dev/virtual_fb:\n"
+        "    add <ID>  - add new fb device\n"
+        "    del <ID>  - delete fb device\n";
+    const size_t msgsize = strlen(message);
+    loff_t off = *offset;
 
-//     *offset+=length;
-//     return length;
-// }
+    if (off >= msgsize) {
+        return 0;
+    }
 
+    if (length > msgsize - off) {
+        length = msgsize - off;
+    }
+
+    if (copy_to_user(buffer, message + off, length) != 0) {
+        return -EFAULT;
+    }
+
+    *offset += length;
+
+    return length;
+}
 	
-// static void execute_command(char command, int arg1) {
-//     switch(command) {
-//         case 'a':
-//             // vfb_add_device(virt_ts_dev);
+static void vfb_devhandler_execute_command(const char *cmd, const char* name)
+{
+    if (0 == strncmp(cmd, "add", 3)) {
+		vfb_create_device(name);
+    } else if (0 == strncmp(cmd, "del", 3)) {
+		vfb_delete_device(name);
+    } else {
+		printk("<4>virtual_fb: Unknown command<%s> with ID<%s>\n", cmd, name);
+    }
+}
 
-// 			int freedev = -1;
-// 			while (vfb_device_pool[++freedev]) {
-// 				;
-// 			}
+static ssize_t vfb_devhandler_write(struct file *filp, const char *ubuf, size_t len, loff_t *off)
+{
+    char cmd[4] = {0};
+    char vfbid[16] = {0};
 
-// 			vfb_device_pool[freedev] = platform_device_alloc("vfb", 0);
-// 			if (vfb_device_pool[freedev]) {
-// 				platform_device_add(vfb_device_pool[freedev]);
-// 			} else {
-// 				platform_device_put(vfb_device_pool[freedev]);
-// 			}
+    char buf[64];
+    size_t len_to_use = len;
+    size_t i;
+    size_t p = 0;
 
-//             break;
-//         case 'd':
-//             // vfb_delete_device(virt_ts_dev, arg1);
-//             break;
-        
-//         default:
-//             printk("<4>virtual_fb: Unknown command %c with arg %d\n", command, arg1);
-//     }
-// }
+    if (len_to_use > sizeof(buf)) {
+		len_to_use = sizeof(buf);
+	}
 
+    if (copy_from_user(buf, ubuf, len_to_use) != 0) {
+        return -EFAULT;
+    }
 
-// static ssize_t device_write(struct file *filp, const char *buff, size_t len, loff_t *off)
-// {
-//     char command;
-//     int arg1;
+    for (i = 0; i < len_to_use; ++i) {
+        if (buf[i] == '\n') {
+            buf[i] = '\0';
+            if (sscanf(buf + p, "%4s %16[^\n]", cmd, vfbid) != 2) {
+                printk("<4>virtual_fb: sscanf failed to interpret this input\n");
+            }
+            p = i + 1;
 
-//     char buf[64];
-//     size_t len_to_use = len;
-//     size_t i;
-//     size_t p=0;
+			vfb_devhandler_execute_command(cmd, vfbid);
+        }
+    }
 
-//     if (len_to_use > sizeof(buf)) len_to_use = sizeof(buf);
+    if (p == 0 && len != 0) {
+        printk("<4>virtual_fb: Command incomplete or too long. Trailing \\n is required.\n");
+        // prevent endless loop
+        return len;
+    }
 
-//     if (copy_from_user(buf, buff, len_to_use) != 0) {
-//         return -EFAULT;
-//     }
-//     for(i=0; i<len_to_use; ++i) {
-//         if (buf[i]=='\n') {
-//             buf[i] = '\0';
-//             if(sscanf(buf+p, "%c%d", &command, &arg1) != 2) {
-//                 printk("<4>virtual_fb: sscanf failed to interpret this input\n");
-//             }
-//             p=i+1;
-//             execute_command(command, arg1);
-//         }
-//     }
-//     if (p == 0 && len != 0) {
-//         printk("<4>virtual_fb: Command incomplete or too long. Trailing \\n is required.\n");
-//         // prevent endless loop
-//         return len;
-//     }
+    return p;
+}
 
-//     return p;
-// }
+int vfb_devhandler_init(void)
+{
+    int res = 0;
 
-// void vfb_pool_exit(void)
-// {
-    	
-// 	// input_unregister_device(virt_ts_dev);
+    vfb_devhandler_major = register_chrdev(0, VFB_DEVHANDLER_NAME, &vfb_devhandler_fops);	
+    if (vfb_devhandler_major < 0) {
+	    printk("Registering the character device failed with %d\n", vfb_devhandler_major);
+        res = vfb_devhandler_major;
+	} else {
+		printk("virtual_fb: vfb_devhandler_major=%d\n", vfb_devhandler_major);
+		vfb_devhandler_cl = class_create(THIS_MODULE, VFB_DEVHANDLER_NAME);
+		if (!IS_ERR(vfb_devhandler_cl)) {
+			vfb_devhandler_dev = device_create(vfb_devhandler_cl, NULL, MKDEV(vfb_devhandler_major, 0), NULL, VFB_DEVHANDLER_NAME);
+		}
+	}
 
-//     if (!IS_ERR(cl)) {
-// 	    device_destroy(cl, MKDEV(Major,0));
-// 	    class_destroy(cl);
-//     }
-//     unregister_chrdev(Major, DEVICE_NAME);
+    return res;
+}
 
-// }
+void vfb_devhandler_exit(void)
+{
+    if (!IS_ERR(vfb_devhandler_cl)) {
+	    device_destroy(vfb_devhandler_cl, MKDEV(vfb_devhandler_major, 0));
+	    class_destroy(vfb_devhandler_cl);
+    }
+
+    unregister_chrdev(vfb_devhandler_major, VFB_DEVHANDLER_NAME);
+}
