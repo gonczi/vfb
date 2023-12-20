@@ -25,6 +25,9 @@
 
 #define VFB_DRIVER_NAME "vfb"
 #define VFB_DEVHANDLER_NAME "virtual_fb"
+#define VFB_FBDEV_NAME_DEFAULT "Virtual FB"
+#define VFB_UNIQ_LEN 64
+#define VFB_UNIQ_LEN_S "64"		// for sscanf pattern 
 
     /*
      *  RAM we reserve for the frame buffer. This defines the maximum screen
@@ -57,6 +60,7 @@ static const struct fb_videomode vfb_default = {
 };
 
 static struct fb_fix_screeninfo vfb_fix = {
+	.id =		VFB_FBDEV_NAME_DEFAULT,
 	.type =		FB_TYPE_PACKED_PIXELS,
 	.visual =	FB_VISUAL_PSEUDOCOLOR,
 	.xpanstep =	1,
@@ -93,16 +97,22 @@ static const struct fb_ops vfb_ops = {
 	.fb_mmap		= vfb_mmap,
 };
 
-static int vfb_create_device(const char* name);
-static void vfb_delete_device(const char* name);
-static void vfb_get_device_name(struct platform_device *dev, char* name, size_t max_len);
+static int vfb_create_device(const char* uniq);
+static void vfb_delete_device(const char* uniq);
+static void vfb_get_device_uniq(struct fb_info *fb_info, char* uniq, size_t max_len);
 static void vfb_delete_devices(void);
+
+static ssize_t vfb_show_uniq(struct device *device, struct device_attribute *attr, char *buf);
+static struct device_attribute vfb_device_attr_uniq = __ATTR(uniq, S_IRUGO, vfb_show_uniq, NULL);
+
+static int vfb_add_device_attr_uniq(struct fb_info *fb_info);
+static void vfb_cleanup_device_attr_uniq(struct fb_info *fb_info);
 
 static DEFINE_MUTEX(vfb_device_pool_lock);
 #define VFB_DEVICE_POOL_SIZE FB_MAX
 struct vfb_device_pool_item {
 	int in_use;
-	char id[16];
+	char uniq[VFB_UNIQ_LEN];
 	struct platform_device *dev;
 };
 static struct vfb_device_pool_item vfb_device_pool[VFB_DEVICE_POOL_SIZE];
@@ -493,7 +503,6 @@ static int vfb_probe(struct platform_device *dev)
 	}
 
 	info->fix = vfb_fix;
-	vfb_get_device_name(dev, info->fix.id, sizeof(info->fix.id));
 	info->fix.smem_start = (unsigned long) videomemory;
 	info->fix.smem_len = videomemorysize;
 
@@ -507,7 +516,10 @@ static int vfb_probe(struct platform_device *dev)
 	retval = register_framebuffer(info);
 	if (retval < 0)
 		goto err2;
+	
 	platform_set_drvdata(dev, info);
+
+	vfb_add_device_attr_uniq(info);
 
 	vfb_set_par(info);
 
@@ -532,6 +544,7 @@ static void vfb_remove(struct platform_device *dev)
 
 	if (info) {
 		videomemory = info->screen_buffer;
+		vfb_cleanup_device_attr_uniq(info);
 		unregister_framebuffer(info);
 		vfree(videomemory);
 		fb_dealloc_cmap(&info->cmap);
@@ -547,7 +560,7 @@ static struct platform_driver vfb_driver = {
 	},
 };
 
-static int vfb_create_device(const char* name)
+static int vfb_create_device(const char* uniq)
 {
 	int ret;
 	int pdpidx = -1;
@@ -561,7 +574,7 @@ static int vfb_create_device(const char* name)
 	name_already_exists = false;
 	for (int i = 0; i < VFB_DEVICE_POOL_SIZE; i++) {
 		if (vfb_device_pool[i].in_use) {
-			if (0 == strncmp(vfb_device_pool[i].id, name, sizeof(vfb_device_pool[i].id) - 1)) {
+			if (0 == strncmp(vfb_device_pool[i].uniq, uniq, sizeof(vfb_device_pool[i].uniq) - 1)) {
 				name_already_exists = true;
 				break;
 			}
@@ -572,7 +585,7 @@ static int vfb_create_device(const char* name)
 		for (int i = 0; i < VFB_DEVICE_POOL_SIZE; i++) {
 			if (!vfb_device_pool[i].in_use) {
 				vfb_device_pool[i].in_use = 1;
-				strncpy(vfb_device_pool[i].id, name, sizeof(vfb_device_pool[i].id)); // --> /sys/class/graphics/fb*/name
+				strncpy(vfb_device_pool[i].uniq, uniq, sizeof(vfb_device_pool[i].uniq)); // --> /sys/class/graphics/fb*/uniq
 				pdpidx = i;
 				break;
 			}
@@ -583,7 +596,7 @@ static int vfb_create_device(const char* name)
 	//------------------------------------------
 
 	if (true == name_already_exists) {
-		printk("vfb_create_device: device name (%s) already exists\n", name);
+		printk("vfb_create_device: device uniq (%s) already exists\n", uniq);
 		return -EINVAL;
 	}
 
@@ -609,16 +622,16 @@ static int vfb_create_device(const char* name)
 	return ret;
 }
 
-void vfb_delete_device(const char* name)
+void vfb_delete_device(const char* uniq)
 {
-	printk("vfb_delete_device [%s]\n", name);
+	printk("vfb_delete_device [%s]\n", uniq);
 
 	for (int i = 0; i < VFB_DEVICE_POOL_SIZE; i++) {
 		struct platform_device *dev = NULL;
 
 		mutex_lock(&vfb_device_pool_lock);
 		if (vfb_device_pool[i].in_use
-			&& (0 == strncmp(vfb_device_pool[i].id, name, sizeof(vfb_device_pool[i].id) - 1))) {
+			&& (0 == strncmp(vfb_device_pool[i].uniq, uniq, sizeof(vfb_device_pool[i].uniq) - 1))) {
 			
 			dev = vfb_device_pool[i].dev;
 			vfb_device_pool[i].in_use = 0;
@@ -634,18 +647,18 @@ void vfb_delete_device(const char* name)
 		}
 	}
 
-	printk("vfb_delete_devices: device not found\n");
+	printk("vfb_delete_device: device not found\n");
 }
 
-static void vfb_get_device_name(struct platform_device *dev, char* name, size_t max_len)
+static void vfb_get_device_uniq(struct fb_info *fb_info, char* uniq, size_t max_len)
 {
 	mutex_lock(&vfb_device_pool_lock);
 	for (int i = 0; i < VFB_DEVICE_POOL_SIZE; i++) {
-		if (vfb_device_pool[i].in_use 
-			&& (dev == vfb_device_pool[i].dev)) {
-
-			strncpy(name, vfb_device_pool[i].id, max_len);
-			break;
+		if (vfb_device_pool[i].in_use) {
+			if ((struct fb_info *)platform_get_drvdata(vfb_device_pool[i].dev) == fb_info) {
+				strncpy(uniq, vfb_device_pool[i].uniq, max_len);
+				break;
+			}
 		}
 	}
 	mutex_unlock(&vfb_device_pool_lock);
@@ -695,7 +708,7 @@ static int __init vfb_init(void)
 	ret = platform_driver_register(&vfb_driver);
 
 	if (!ret) {
-		ret = vfb_create_device("Virtual FB");
+		ret = vfb_create_device("");
 		if (ret) {
 			platform_driver_unregister(&vfb_driver);
 		}
@@ -725,6 +738,34 @@ module_exit(vfb_exit);
 
 MODULE_LICENSE("GPL");
 #endif				/* MODULE */
+
+
+
+
+static ssize_t vfb_show_uniq(struct device *device,
+			 struct device_attribute *attr, char *buf)
+{
+	char uniq_buff[VFB_UNIQ_LEN] = "";
+	struct fb_info *fb_info = dev_get_drvdata(device);
+
+	vfb_get_device_uniq(fb_info, uniq_buff, sizeof(uniq_buff));
+
+	return sysfs_emit(buf, "%s\n", uniq_buff);
+}
+
+static int vfb_add_device_attr_uniq(struct fb_info *fb_info)
+{
+	device_create_file(fb_info->dev, &vfb_device_attr_uniq);
+	return 0;
+}
+
+static void vfb_cleanup_device_attr_uniq(struct fb_info *fb_info)
+{
+	device_remove_file(fb_info->dev, &vfb_device_attr_uniq);
+}
+
+
+
 
 static int vfb_devhandler_open(struct inode *inode, struct file *file) 
 {
@@ -781,9 +822,9 @@ static void vfb_devhandler_execute_command(const char *cmd, const char* name)
 static ssize_t vfb_devhandler_write(struct file *filp, const char *ubuf, size_t len, loff_t *off)
 {
     char cmd[4] = {0};
-    char vfbid[16] = {0};
+    char vfb_uniq[VFB_UNIQ_LEN] = {0};
 
-    char buf[64];
+    char buf[VFB_UNIQ_LEN * 2];
     size_t len_to_use = len;
     size_t i;
     size_t p = 0;
@@ -799,12 +840,12 @@ static ssize_t vfb_devhandler_write(struct file *filp, const char *ubuf, size_t 
     for (i = 0; i < len_to_use; ++i) {
         if (buf[i] == '\n') {
             buf[i] = '\0';
-            if (sscanf(buf + p, "%4s %16[^\n]", cmd, vfbid) != 2) {
+            if (sscanf(buf + p, "%4s %" VFB_UNIQ_LEN_S "[^\n]", cmd, vfb_uniq) != 2) {
                 printk("<4>virtual_fb: sscanf failed to interpret this input\n");
             }
             p = i + 1;
 
-			vfb_devhandler_execute_command(cmd, vfbid);
+			vfb_devhandler_execute_command(cmd, vfb_uniq);
         }
     }
 
