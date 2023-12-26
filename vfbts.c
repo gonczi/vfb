@@ -1,9 +1,7 @@
 /*
- *  linux/drivers/video/vfb.c -- Virtual frame buffer device
+ *  vfbts.c -- Virtual framebuffer and touchscreen driver for fb based VNC servers
  *
- *      Copyright (C) 2002 James Simmons
- *
- *	Copyright (C) 1997 Geert Uytterhoeven
+ *      Copyright (C) 2023 Zoltan Gonczi
  *
  *  This file is subject to the terms and conditions of the GNU General Public
  *  License. See the file COPYING in the main directory of this archive for
@@ -23,12 +21,16 @@
 #include <linux/fb.h>
 #include <linux/init.h>
 
-#define VFB_DRIVER_NAME "vfb"
-#define VFB_DEVHANDLER_NAME "virtual_fb"
-#define VFB_FBDEV_NAME_DEFAULT "Virtual FB"
+#include <linux/input.h>
+#include <linux/input/mt.h>
+
+#define VFB_DRIVER_NAME "vfbts"
+#define VFB_DEVHANDLER_NAME "virtual_fbts"
+#define VFB_FBDEV_NAME "Virtual FB"
 #define VFB_UNIQ_LEN 64
 #define VFB_UNIQ_LEN_S "64"		// for sscanf pattern 
 
+#define VFB_TSDEV_NAME "Virtual touchscreen"
     /*
      *  RAM we reserve for the frame buffer. This defines the maximum screen
      *  size
@@ -60,7 +62,7 @@ static const struct fb_videomode vfb_default = {
 };
 
 static struct fb_fix_screeninfo vfb_fix = {
-	.id =		VFB_FBDEV_NAME_DEFAULT,
+	.id =		VFB_FBDEV_NAME,
 	.type =		FB_TYPE_PACKED_PIXELS,
 	.visual =	FB_VISUAL_PSEUDOCOLOR,
 	.xpanstep =	1,
@@ -68,10 +70,6 @@ static struct fb_fix_screeninfo vfb_fix = {
 	.ywrapstep =	1,
 	.accel =	FB_ACCEL_NONE,
 };
-
-static bool vfb_enable __initdata = 0;	/* disabled by default */
-module_param(vfb_enable, bool, 0);
-MODULE_PARM_DESC(vfb_enable, "Enable Virtual FB driver");
 
 static int vfb_check_var(struct fb_var_screeninfo *var,
 			 struct fb_info *info);
@@ -114,6 +112,8 @@ struct vfb_device_pool_item {
 	int in_use;
 	char uniq[VFB_UNIQ_LEN];
 	struct platform_device *dev;
+
+	struct input_dev *ts_dev;
 };
 static struct vfb_device_pool_item vfb_device_pool[VFB_DEVICE_POOL_SIZE];
 
@@ -137,6 +137,16 @@ struct file_operations vfb_devhandler_fops __attribute__((__section__(".text")))
 	open: vfb_devhandler_open,
 	release: vfb_devhandler_release
 };
+
+#define ABS_X_MIN	0
+#define ABS_X_MAX	1024
+#define ABS_Y_MIN	0
+#define ABS_Y_MAX	768
+
+#define MAX_CONTACTS 10    // 10 fingers is it
+
+static int virt_ts_init(struct input_dev **p_virt_ts_dev, const char* uniq);
+static void virt_ts_unregister(struct input_dev *virt_ts_dev);
 
 
     /*
@@ -435,40 +445,6 @@ static int vfb_mmap(struct fb_info *info,
 	return remap_vmalloc_range(vma, (void *)info->fix.smem_start, vma->vm_pgoff);
 }
 
-#ifndef MODULE
-/*
- * The virtual framebuffer driver is only enabled if explicitly
- * requested by passing 'video=vfb:' (or any actual options).
- */
-static int __init vfb_setup(char *options)
-{
-	char *this_opt;
-
-	printk("vfb_setup\n");
-
-	vfb_enable = 0;
-
-	if (!options)
-		return 1;
-
-	vfb_enable = 1;
-
-	if (!*options)
-		return 1;
-
-	while ((this_opt = strsep(&options, ",")) != NULL) {
-		if (!*this_opt)
-			continue;
-		/* Test disable for backwards compatibility */
-		if (!strcmp(this_opt, "disable"))
-			vfb_enable = 0;
-		else
-			mode_option = this_opt;
-	}
-	return 1;
-}
-#endif  /*  MODULE  */
-
     /*
      *  Initialisation
      */
@@ -564,24 +540,24 @@ static int vfb_create_device(const char* uniq)
 {
 	int ret;
 	int pdpidx = -1;
-	bool name_already_exists = false;
+	bool uniq_already_exists = false;
 
 	printk("vfb_create_device\n");
 
 	//------------------------------------------
 	mutex_lock(&vfb_device_pool_lock);
 	
-	name_already_exists = false;
+	uniq_already_exists = false;
 	for (int i = 0; i < VFB_DEVICE_POOL_SIZE; i++) {
 		if (vfb_device_pool[i].in_use) {
 			if (0 == strncmp(vfb_device_pool[i].uniq, uniq, sizeof(vfb_device_pool[i].uniq) - 1)) {
-				name_already_exists = true;
+				uniq_already_exists = true;
 				break;
 			}
 		}
 	}
 	
-	if (false == name_already_exists) {
+	if (false == uniq_already_exists) {
 		for (int i = 0; i < VFB_DEVICE_POOL_SIZE; i++) {
 			if (!vfb_device_pool[i].in_use) {
 				vfb_device_pool[i].in_use = 1;
@@ -595,7 +571,7 @@ static int vfb_create_device(const char* uniq)
 	mutex_unlock(&vfb_device_pool_lock);
 	//------------------------------------------
 
-	if (true == name_already_exists) {
+	if (true == uniq_already_exists) {
 		printk("vfb_create_device: device uniq (%s) already exists\n", uniq);
 		return -EINVAL;
 	}
@@ -617,6 +593,10 @@ static int vfb_create_device(const char* uniq)
 	if (ret) {
 		platform_device_put(vfb_device_pool[pdpidx].dev);
 		vfb_device_pool[pdpidx].in_use = 0;
+	} else {
+
+		vfb_device_pool[pdpidx].ts_dev = NULL;
+	 	ret = virt_ts_init(&(vfb_device_pool[pdpidx].ts_dev), vfb_device_pool[pdpidx].uniq);
 	}
 
 	return ret;
@@ -628,21 +608,29 @@ void vfb_delete_device(const char* uniq)
 
 	for (int i = 0; i < VFB_DEVICE_POOL_SIZE; i++) {
 		struct platform_device *dev = NULL;
+		struct input_dev *ts_dev = NULL;
 
 		mutex_lock(&vfb_device_pool_lock);
 		if (vfb_device_pool[i].in_use
 			&& (0 == strncmp(vfb_device_pool[i].uniq, uniq, sizeof(vfb_device_pool[i].uniq) - 1))) {
 			
 			dev = vfb_device_pool[i].dev;
+			ts_dev = vfb_device_pool[i].ts_dev;
 			vfb_device_pool[i].in_use = 0;
+			vfb_device_pool[i].ts_dev = NULL;
 			vfb_device_pool[i].dev = NULL;
 		}
 		mutex_unlock(&vfb_device_pool_lock);
 
+		if (ts_dev) {
+			printk("vfb_delete_device: virt_ts_unregister[%d]\n", i);
+			virt_ts_unregister(ts_dev);
+		}
+
 		if (dev) {
 			printk("vfb_delete_device: platform_device_unregister[%d]\n", i);
 			platform_device_unregister(dev);
-			
+
 			return;
 		}
 	}
@@ -685,60 +673,6 @@ static void vfb_delete_devices(void)
 		}
 	}
 }
-
-static int __init vfb_init(void)
-{
-	int ret = 0;
-
-	printk("vfb_init\n");
-
-#ifndef MODULE
-	char *option = NULL;
-
-	if (fb_get_options(VFB_DRIVER_NAME, &option))
-		return -ENODEV;
-	vfb_setup(option);
-#endif
-
-	if (!vfb_enable)
-		return -ENXIO;
-
-	memset(&vfb_device_pool, 0, sizeof(vfb_device_pool));
-
-	ret = platform_driver_register(&vfb_driver);
-
-	if (!ret) {
-		ret = vfb_create_device("");
-		if (ret) {
-			platform_driver_unregister(&vfb_driver);
-		}
-	}
-
-	if (!ret) {
-		vfb_devhandler_init();
-	}
-
-	return ret;
-}
-
-module_init(vfb_init);
-
-#ifdef MODULE
-static void __exit vfb_exit(void)
-{
-	printk("vfb_exit\n");
-
-	vfb_devhandler_exit();
-
-	vfb_delete_devices();
-	platform_driver_unregister(&vfb_driver);
-}
-
-module_exit(vfb_exit);
-
-MODULE_LICENSE("GPL");
-#endif				/* MODULE */
-
 
 
 
@@ -785,9 +719,9 @@ static int vfb_devhandler_release(struct inode *inode, struct file *file)
 static ssize_t vfb_devhandler_read(struct file *filp, char *buffer, size_t length, loff_t *offset) 
 {
     const char* message = 
-        "Usage: write the following commands to /dev/virtual_fb:\n"
-        "    add <ID>  - add new fb device\n"
-        "    del <ID>  - delete fb device\n";
+        "Usage: write the following commands to /dev/" VFB_DEVHANDLER_NAME ":\n"
+        "    add <UUID>  - add new fb device\n"
+        "    del <UUID>  - delete fb device\n";
     const size_t msgsize = strlen(message);
     loff_t off = *offset;
 
@@ -815,7 +749,7 @@ static void vfb_devhandler_execute_command(const char *cmd, const char* name)
     } else if (0 == strncmp(cmd, "del", 3)) {
 		vfb_delete_device(name);
     } else {
-		printk("<4>virtual_fb: Unknown command<%s> with ID<%s>\n", cmd, name);
+		printk("<4>" VFB_DEVHANDLER_NAME ": Unknown command<%s> with ID<%s>\n", cmd, name);
     }
 }
 
@@ -841,7 +775,7 @@ static ssize_t vfb_devhandler_write(struct file *filp, const char *ubuf, size_t 
         if (buf[i] == '\n') {
             buf[i] = '\0';
             if (sscanf(buf + p, "%4s %" VFB_UNIQ_LEN_S "[^\n]", cmd, vfb_uniq) != 2) {
-                printk("<4>virtual_fb: sscanf failed to interpret this input\n");
+                printk("<4>" VFB_DEVHANDLER_NAME ": sscanf failed to interpret this input\n");
             }
             p = i + 1;
 
@@ -850,7 +784,7 @@ static ssize_t vfb_devhandler_write(struct file *filp, const char *ubuf, size_t 
     }
 
     if (p == 0 && len != 0) {
-        printk("<4>virtual_fb: Command incomplete or too long. Trailing \\n is required.\n");
+        printk("<4>" VFB_DEVHANDLER_NAME ": Command incomplete or too long. Trailing \\n is required.\n");
         // prevent endless loop
         return len;
     }
@@ -867,7 +801,7 @@ int vfb_devhandler_init(void)
 	    printk("Registering the character device failed with %d\n", vfb_devhandler_major);
         res = vfb_devhandler_major;
 	} else {
-		printk("virtual_fb: vfb_devhandler_major=%d\n", vfb_devhandler_major);
+		printk("" VFB_DEVHANDLER_NAME ": vfb_devhandler_major=%d\n", vfb_devhandler_major);
 		vfb_devhandler_cl = class_create(THIS_MODULE, VFB_DEVHANDLER_NAME);
 		if (!IS_ERR(vfb_devhandler_cl)) {
 			vfb_devhandler_dev = device_create(vfb_devhandler_cl, NULL, MKDEV(vfb_devhandler_major, 0), NULL, VFB_DEVHANDLER_NAME);
@@ -886,3 +820,79 @@ void vfb_devhandler_exit(void)
 
     unregister_chrdev(vfb_devhandler_major, VFB_DEVHANDLER_NAME);
 }
+
+// --------------------------------------------------------------------------------------
+
+static int virt_ts_init(struct input_dev **p_virt_ts_dev, const char* uniq)
+{
+	int err;
+	struct input_dev *virt_ts_dev;
+
+	virt_ts_dev = (*p_virt_ts_dev) = input_allocate_device();
+	if (!virt_ts_dev)
+		return -ENOMEM;
+
+	virt_ts_dev->evbit[0] = BIT_MASK(EV_ABS) | BIT_MASK(EV_KEY);
+	virt_ts_dev->keybit[BIT_WORD(BTN_TOUCH)] = BIT_MASK(BTN_TOUCH);
+
+	input_set_abs_params(virt_ts_dev, ABS_X, ABS_X_MIN, ABS_X_MAX, 0, 0);
+	input_set_abs_params(virt_ts_dev, ABS_Y, ABS_Y_MIN, ABS_Y_MAX, 0, 0);
+
+	virt_ts_dev->name = VFB_TSDEV_NAME;
+	virt_ts_dev->uniq = uniq;
+
+    input_mt_init_slots(virt_ts_dev, MAX_CONTACTS, INPUT_MT_DIRECT);
+
+	input_set_abs_params(virt_ts_dev, ABS_MT_POSITION_X, ABS_X_MIN, ABS_X_MAX, 0, 0);
+	input_set_abs_params(virt_ts_dev, ABS_MT_POSITION_Y, ABS_Y_MIN, ABS_Y_MAX, 0, 0);
+
+	err = input_register_device(virt_ts_dev);
+	if (!err) {
+		return 0;
+	}
+
+	input_free_device(virt_ts_dev);
+ 	(*p_virt_ts_dev) = NULL;
+	return err;
+}
+
+static void virt_ts_unregister(struct input_dev *virt_ts_dev)
+{
+	input_unregister_device(virt_ts_dev);
+}
+
+// --------------------------------------------------------------------------------------
+
+static int __init vfb_init(void)
+{
+	int ret = 0;
+
+	printk("vfb_init\n");
+
+	memset(&vfb_device_pool, 0, sizeof(vfb_device_pool));
+
+	ret = platform_driver_register(&vfb_driver);
+
+	if (!ret) {
+		vfb_devhandler_init();
+	}
+
+	return ret;
+}
+
+static void __exit vfb_exit(void)
+{
+	printk("vfb_exit\n");
+
+	vfb_devhandler_exit();
+
+	vfb_delete_devices();
+	platform_driver_unregister(&vfb_driver);
+}
+
+module_init(vfb_init);
+module_exit(vfb_exit);
+
+MODULE_AUTHOR("Zoltan Gonczi, zoltan.gonczi@gmail.com");
+MODULE_DESCRIPTION("Virtual framebuffer and touchscreen driver for fb based VNC servers");
+MODULE_LICENSE("GPL");
