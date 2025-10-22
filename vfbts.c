@@ -802,7 +802,8 @@ int vfb_devhandler_init(void)
         res = vfb_devhandler_major;
 	} else {
 		printk("" VFB_DEVHANDLER_NAME ": vfb_devhandler_major=%d\n", vfb_devhandler_major);
-		vfb_devhandler_cl = class_create(THIS_MODULE, VFB_DEVHANDLER_NAME);
+		// vfb_devhandler_cl = class_create(THIS_MODULE, VFB_DEVHANDLER_NAME);
+		vfb_devhandler_cl = class_create(VFB_DEVHANDLER_NAME);
 		if (!IS_ERR(vfb_devhandler_cl)) {
 			vfb_devhandler_dev = device_create(vfb_devhandler_cl, NULL, MKDEV(vfb_devhandler_major, 0), NULL, VFB_DEVHANDLER_NAME);
 		}
